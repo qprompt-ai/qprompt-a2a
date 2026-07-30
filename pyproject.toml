@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qprompt-a2a"
+version = "0.1.0"
+description = "Renders qprompt IR into a Docker Compose project: one A2A-protocol service per agent, plus a generated orchestrator that owns workflow routing, wired to Docker Model Runner via Compose's models: key."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jinja2>=3.1",
+    "pydantic>=2.6",
+    # Reused directly, not re-vendored: IR loader/models, the agent-kind
+    # dispatch primitives (evaluate_rules, run_container + adapter registry,
+    # resolve_state_assignments), and the view-building logic that already
+    # merges state fields and translates routes -- see codegen/view.py.
+    "qprompt-langgraph",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+# Only needed inside *generated* service containers, not by qprompt-a2a
+# itself (which only renders text) -- listed here so `pip install
+# qprompt-a2a[services]` gives you everything a generated Dockerfile needs
+# without hand-copying versions into the Dockerfile template.
+services = [
+    "a2a-sdk[http-server]>=1.1",
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+    "openai>=1.0",
+]
+
+[project.scripts]
+qprompt-a2a = "qprompt_a2a.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qprompt_a2a"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

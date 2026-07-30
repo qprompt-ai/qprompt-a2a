@@ -1,0 +1,28 @@
+FROM python:3.12-slim
+
+WORKDIR /opt
+
+# qprompt-langgraph and qprompt-a2a aren't published to PyPI -- installed
+# from the local source trees this build's context includes (see
+# docker-compose.yml's build.context, computed relative to this file).
+COPY {{ qprompt_langgraph_rel }} qprompt-langgraph
+COPY {{ qprompt_a2a_rel }} qprompt-a2a
+RUN pip install --no-cache-dir ./qprompt-langgraph "./qprompt-a2a[services]"
+
+# Every agent gets the Docker CLI, not just container-kind ones -- keeping
+# one shared Dockerfile for every service is simpler than templating a
+# conditional per agent kind, and the size cost is small. run_container
+# shells out to the *host's* Docker daemon via the socket bind-mounted in
+# docker-compose.yml ("sibling containers", not Docker-in-Docker).
+# docker-cli is only a Recommends of docker.io on Debian, not a Depends --
+# confirmed against a real build: --no-install-recommends alone pulls in
+# dockerd but not the /usr/bin/docker client itself, so it has to be
+# listed explicitly.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends docker.io docker-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG SERVICE_NAME
+COPY {{ services_rel }}/${SERVICE_NAME}.py /opt/service.py
+
+CMD ["python", "/opt/service.py"]

@@ -1,0 +1,15 @@
+# Example override for container-kind agents that need a registered
+# run_container adapter (see each service's ADAPTER_MODULES comment, and
+# qprompt_langgraph.runtime.register_container_adapter's docstring, for
+# why the generic default doesn't always work). Copy to
+# docker-compose.override.yml (Compose merges it automatically) and fill
+# in whichever adapter module actually handles each image -- codegen
+# can't know this itself, since which Python module registers an adapter
+# for a given image isn't something the DSL declares.
+services:
+{% for svc in container_services %}
+  {{ svc.compose_name }}:
+    environment:
+      # image: {{ svc.node.agent.image }}
+      - ADAPTER_MODULES=
+{% endfor %}
