@@ -1,15 +1,26 @@
-# Example override for container-kind agents that need a registered
-# run_container adapter (see each service's ADAPTER_MODULES comment, and
-# qprompt_langgraph.runtime.register_container_adapter's docstring, for
-# why the generic default doesn't always work). Copy to
-# docker-compose.override.yml (Compose merges it automatically) and fill
-# in whichever adapter module actually handles each image -- codegen
-# can't know this itself, since which Python module registers an adapter
-# for a given image isn't something the DSL declares.
+# Example override for the two kinds of agent that can need a registered
+# adapter module. Copy to docker-compose.override.yml (Compose merges it
+# automatically) and fill in whichever module actually applies -- codegen
+# can't know this itself, since which Python module registers behaviour for
+# a given image or output format isn't something the DSL declares.
+#
+# - container-kind: a run_container adapter, when an image doesn't fit the
+#   generic default (see register_container_adapter's docstring).
+# - llm-kind: output filters, when a model wraps its answer in something
+#   only meaningful for the format this agent generates (see
+#   register_output_filter's docstring). Leave empty to publish the raw
+#   fence-stripped response.
+#
+# Both come from the same ADAPTER_MODULES variable: one module can register
+# both (qprompt_langgraph.adapters.cypress does).
 services:
-{% for svc in container_services %}
+{% for svc in adapter_services %}
   {{ svc.compose_name }}:
     environment:
-      # image: {{ svc.node.agent.image }}
+{% if svc.node.agent.kind == 'container' %}
+      # container-kind, image: {{ svc.node.agent.image }}
+{% else %}
+      # llm-kind, model: {{ svc.node.agent.model }}
+{% endif %}
       - ADAPTER_MODULES=
 {% endfor %}

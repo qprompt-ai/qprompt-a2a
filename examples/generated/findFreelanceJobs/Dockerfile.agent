@@ -5,8 +5,8 @@ WORKDIR /opt
 # qprompt-langgraph and qprompt-a2a aren't published to PyPI -- installed
 # from the local source trees this build's context includes (see
 # docker-compose.yml's build.context, computed relative to this file).
-COPY {{ qprompt_langgraph_rel }} qprompt-langgraph
-COPY {{ qprompt_a2a_rel }} qprompt-a2a
+COPY qprompt-langgraph qprompt-langgraph
+COPY qprompt-a2a qprompt-a2a
 
 # Only services whose agent actually declares context: pull in the RAG
 # extra (langchain/faiss/sentence-transformers/torch) -- confirmed against
@@ -40,6 +40,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ARG SERVICE_NAME
-COPY {{ services_rel }}/${SERVICE_NAME}.py /opt/service.py
+COPY qprompt-a2a/examples/generated/findFreelanceJobs/services/${SERVICE_NAME}.py /opt/service.py
 
 CMD ["python", "/opt/service.py"]

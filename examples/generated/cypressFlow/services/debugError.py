@@ -15,6 +15,7 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 import a2a.helpers as h
 
+from qprompt_langgraph.rag import resource_from_dict, retrieve
 from qprompt_langgraph.runtime import (
     call_http,
     evaluate_rules,
@@ -25,18 +26,35 @@ from qprompt_langgraph.runtime import (
 )
 from qprompt_a2a.runtime import build_agent_app, call_llm
 
+# call_llm strips a wrapping markdown fence (a habit of instruction-tuned
+# chat models generally) but nothing beyond that: where a domain's real
+# output starts and stops has no domain-independent answer, so it can't be
+# hardcoded in a runtime shared by every graph -- see
+# qprompt_langgraph.runtime.register_output_filter's docstring. Set
+# ADAPTER_MODULES (comma-separated dotted module paths, e.g.
+# "qprompt_langgraph.adapters.cypress") in this service's environment --
+# see docker-compose.override.yml.example -- to register whatever output
+# filters this agent's generated format needs. With none set, the raw
+# fence-stripped response is published as-is.
+import importlib
 
-PROMPT = """
-      You are an expert cypress debugger. Given the original request,
-      the current (broken) plan or code, and the failure reason below,
-      produce a corrected version using only official Cypress APIs.
+for _adapter_module in os.environ.get("ADAPTER_MODULES", "").split(","):
+    if _adapter_module.strip():
+        importlib.import_module(_adapter_module.strip())
 
-      Failure rule: {state.rule}
-      Reason: {state.reason}
-      Details: {state.details}
-      Error: {state.error}
-    """
-MODEL_ENV_PREFIX = 'QWEN3_FINETUNED'
+PROMPT = """You are an expert cypress debugger. Given the broken code and the validator or test-execution report describing why it failed, produce a corrected version using only official Cypress APIs. CRITICAL RULES (the same ones the original code was written under --
+a fix that breaks these is not a fix):
+  - Output raw code only -- never wrap it in a markdown code fence
+    (no ``` lines, no language tag); the output is written directly to a .ts file, so a code fence around it is a syntax error.
+  - The whole test must be exactly one describe() block containing
+    exactly one it() block, with every cy. command inside that one it() block. Splitting steps into separate it() blocks is a bug, not a fix -- Cypress resets the page between it() blocks by default, so a later it() can't see what an earlier one visited or typed, and commands referencing it will time out.
+  - cy.visit() must be its own standalone statement, never chained
+    with other commands.
+  - Use a real assertion for verification (e.g.
+    cy.url().should('include', path)) -- never re-visit a URL to "verify" it.
+  - Output only code, no explanations."""
+MODEL_ENV_PREFIX = 'QWEN3_CYDEBUG'
+CONTEXT_RESOURCES = [{'name': 'cypressErrorsFaq', 'type': 'knowledge_base', 'paths': ['https://docs.cypress.io/faq/questions/using-cypress-faq'], 'rag': {'loader': 'web', 'splitter': 'recursive', 'chunk_size': 400, 'chunk_overlap': 50, 'embeddings': {'provider': 'huggingface', 'model': 'sentence-transformers/all-MiniLM-L6-v2'}, 'vector_store': {'type': 'faiss', 'persist_path': '.rag/cypress/errors-faq'}, 'retrieval': {'strategy': 'similarity', 'top_k': 3}}}]
 
 
 class Executor(AgentExecutor):
@@ -45,7 +63,11 @@ class Executor(AgentExecutor):
         inputs: dict[str, Any] = parts[0] if parts else {}
         state = dict(inputs)
 
-        result = call_llm(env_prefix=MODEL_ENV_PREFIX, model='qwen3_finetuned', prompt=PROMPT, inputs=inputs)
+        rag_query = "\n".join(f"{name}: {inputs.get(name)}" for name in ['test_script', 'bug_details'])
+        rag_chunks = []
+        for resource_dict in CONTEXT_RESOURCES:
+            rag_chunks.extend(retrieve(resource_from_dict(resource_dict), rag_query))
+        result = call_llm(env_prefix=MODEL_ENV_PREFIX, model='qwen3_cydebug', prompt=PROMPT, inputs=inputs, subscribed=['test_script', 'bug_details'], context_chunks=rag_chunks)
         state['test_script'] = result
 
         reply = h.new_data_message(state, context_id=context.context_id, task_id=context.task_id)

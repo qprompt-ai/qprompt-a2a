@@ -7,11 +7,24 @@ WORKDIR /opt
 # docker-compose.yml's build.context, computed relative to this file).
 COPY qprompt-langgraph qprompt-langgraph
 COPY qprompt-a2a qprompt-a2a
-RUN pip install --no-cache-dir ./qprompt-langgraph "./qprompt-a2a[services]"
+
+# Only services whose agent actually declares context: pull in the RAG
+# extra (langchain/faiss/sentence-transformers/torch) -- confirmed against
+# a real build this is not a small cost like docker-cli below: it takes an
+# agent image from ~634MB to ~11.5GB. NEEDS_RAG is set per-service in
+# docker-compose.yml's build.args from svc.node.context_resources, so a
+# service with no context: stays lean.
+ARG NEEDS_RAG=false
+RUN if [ "$NEEDS_RAG" = "true" ]; then \
+      pip install --no-cache-dir "./qprompt-langgraph[rag]" "./qprompt-a2a[services]"; \
+    else \
+      pip install --no-cache-dir ./qprompt-langgraph "./qprompt-a2a[services]"; \
+    fi
 
 # Every agent gets the Docker CLI, not just container-kind ones -- keeping
 # one shared Dockerfile for every service is simpler than templating a
-# conditional per agent kind, and the size cost is small. run_container
+# conditional per agent kind, and the size cost is small (unlike the RAG
+# extra above, which is why that one IS conditional). run_container
 # shells out to the *host's* Docker daemon via the socket bind-mounted in
 # docker-compose.yml ("sibling containers", not Docker-in-Docker).
 # docker-cli is only a Recommends of docker.io on Debian, not a Depends --

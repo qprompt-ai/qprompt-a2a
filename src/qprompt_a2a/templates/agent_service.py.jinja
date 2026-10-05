@@ -15,6 +15,7 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 import a2a.helpers as h
 
+from qprompt_langgraph.rag import resource_from_dict, retrieve
 from qprompt_langgraph.runtime import (
     call_http,
     evaluate_rules,
@@ -25,6 +26,7 @@ from qprompt_langgraph.runtime import (
 )
 from qprompt_a2a.runtime import build_agent_app, call_llm
 
+{% if node.agent.kind in ('container', 'llm') %}
 {% if node.agent.kind == 'container' %}
 # run_container's generic default only works for images that accept input
 # under an extensionless filename and print one clean JSON report --
@@ -37,6 +39,18 @@ from qprompt_a2a.runtime import build_agent_app, call_llm
 # see docker-compose.override.yml.example -- to import whatever adapters
 # image {{ node.agent.image | pyrepr }} actually needs before this service
 # starts handling requests.
+{% else %}
+# call_llm strips a wrapping markdown fence (a habit of instruction-tuned
+# chat models generally) but nothing beyond that: where a domain's real
+# output starts and stops has no domain-independent answer, so it can't be
+# hardcoded in a runtime shared by every graph -- see
+# qprompt_langgraph.runtime.register_output_filter's docstring. Set
+# ADAPTER_MODULES (comma-separated dotted module paths, e.g.
+# "qprompt_langgraph.adapters.cypress") in this service's environment --
+# see docker-compose.override.yml.example -- to register whatever output
+# filters this agent's generated format needs. With none set, the raw
+# fence-stripped response is published as-is.
+{% endif %}
 import importlib
 
 for _adapter_module in os.environ.get("ADAPTER_MODULES", "").split(","):
@@ -47,6 +61,9 @@ for _adapter_module in os.environ.get("ADAPTER_MODULES", "").split(","):
 {% if node.agent.kind == 'llm' %}
 PROMPT = {{ (node.agent.prompt or '') | py_triple_quoted }}
 MODEL_ENV_PREFIX = {{ model_env_prefix | pyrepr }}
+{% if node.context_resources %}
+CONTEXT_RESOURCES = {{ node.context_resources | py_literal }}
+{% endif %}
 {% elif node.agent.kind == 'rules_engine' %}
 RULES = {{ node.agent.rules | py_literal }}
 {% endif %}
@@ -62,7 +79,15 @@ class Executor(AgentExecutor):
         state = dict(inputs)
 
 {% if node.agent.kind == 'llm' %}
-        result = call_llm(env_prefix=MODEL_ENV_PREFIX, model={{ (node.agent.model or '') | pyrepr }}, prompt=PROMPT, inputs=inputs)
+{% if node.context_resources %}
+        rag_query = "\n".join(f"{name}: {inputs.get(name)}" for name in {{ node.subscribe | pyrepr }})
+        rag_chunks = []
+        for resource_dict in CONTEXT_RESOURCES:
+            rag_chunks.extend(retrieve(resource_from_dict(resource_dict), rag_query))
+{% else %}
+        rag_chunks = []
+{% endif %}
+        result = call_llm(env_prefix=MODEL_ENV_PREFIX, model={{ (node.agent.model or '') | pyrepr }}, prompt=PROMPT, inputs=inputs, subscribed={{ node.subscribe | pyrepr }}, context_chunks=rag_chunks)
 {% for ch in node.publish %}
         state[{{ ch | pyrepr }}] = result
 {% endfor %}
@@ -71,7 +96,7 @@ class Executor(AgentExecutor):
         result = evaluate_rules(text, RULES)
 {% if node.agent.emit_state %}
         assignments = EMIT_STATE["on_pass" if result.passed else "on_fail"]
-        state.update(resolve_state_assignments(assignments, {"rule": result.rule or {}}))
+        state.update(resolve_state_assignments(assignments, {"rule": result.rule or {}}, defaults={{ node.state_defaults | py_literal }}))
 {% endif %}
 {% elif node.agent.kind == 'container' %}
         report = run_container(
@@ -86,7 +111,7 @@ class Executor(AgentExecutor):
 {% endfor %}
 {% if node.agent.emit_state %}
         assignments = EMIT_STATE["on_pass" if report.get("passed") else "on_fail"]
-        state.update(resolve_state_assignments(assignments, {"report": report}))
+        state.update(resolve_state_assignments(assignments, {"report": report}, defaults={{ node.state_defaults | py_literal }}))
 {% endif %}
 {% elif node.agent.kind == 'db' %}
         result = run_query(connection={{ (node.agent.connection or '') | pyrepr }}, query={{ (node.agent.query or '') | pyrepr }}, inputs=inputs)
@@ -94,7 +119,13 @@ class Executor(AgentExecutor):
         state[{{ ch | pyrepr }}] = result
 {% endfor %}
 {% elif node.agent.kind == 'http' %}
-        result = call_http(method={{ (node.agent.method or 'get') | pyrepr }}, url={{ (node.agent.url or '') | pyrepr }}, inputs=inputs)
+        result = call_http(
+            method={{ (node.agent.method or 'get') | pyrepr }},
+            url={{ node.http_url | pyrepr }},
+            inputs={ {% for ch in node.subscribe %}{{ ch | pyrepr }}: inputs.get({{ ch | pyrepr }}){% if not loop.last %}, {% endif %}{% endfor %} },
+            credential={{ node.http_credential | pyrepr }},
+            tool_config={{ (node.agent.tool_config or None) | pyrepr }},
+        )
 {% for ch in node.publish %}
         state[{{ ch | pyrepr }}] = result
 {% endfor %}

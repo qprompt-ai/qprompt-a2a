@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+WORKDIR /opt
+
+COPY qprompt-langgraph qprompt-langgraph
+COPY qprompt-a2a qprompt-a2a
+RUN pip install --no-cache-dir ./qprompt-langgraph "./qprompt-a2a[services]"
+
+COPY qprompt-a2a/examples/generated/findFreelanceJobs/orchestrator.py /opt/orchestrator.py
+
+CMD ["python", "/opt/orchestrator.py"]

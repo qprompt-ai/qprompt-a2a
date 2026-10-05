@@ -15,6 +15,7 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 import a2a.helpers as h
 
+from qprompt_langgraph.rag import resource_from_dict, retrieve
 from qprompt_langgraph.runtime import (
     call_http,
     evaluate_rules,
@@ -25,19 +26,56 @@ from qprompt_langgraph.runtime import (
 )
 from qprompt_a2a.runtime import build_agent_app, call_llm
 
+# call_llm strips a wrapping markdown fence (a habit of instruction-tuned
+# chat models generally) but nothing beyond that: where a domain's real
+# output starts and stops has no domain-independent answer, so it can't be
+# hardcoded in a runtime shared by every graph -- see
+# qprompt_langgraph.runtime.register_output_filter's docstring. Set
+# ADAPTER_MODULES (comma-separated dotted module paths, e.g.
+# "qprompt_langgraph.adapters.cypress") in this service's environment --
+# see docker-compose.override.yml.example -- to register whatever output
+# filters this agent's generated format needs. With none set, the raw
+# fence-stripped response is published as-is.
+import importlib
 
-PROMPT = """
-      You are an expert cypress test developer. Convert the provided
-      textual plan into valid, executable, syntactically correct {output_format}
-      code.
-      CRITICAL RULES:
-        - Follow the plan and request precisely.
-        - Use exact selectors if specified.
-        - cy.visit() must be standalone.
-        - Begin the file with: /// <reference types="cypress" />
-        - Output only code, no explanations.
-    """
+for _adapter_module in os.environ.get("ADAPTER_MODULES", "").split(","):
+    if _adapter_module.strip():
+        importlib.import_module(_adapter_module.strip())
+
+PROMPT = """You are an expert cypress test developer. Convert the provided textual plan into valid, executable, syntactically correct {output_format} code.
+CRITICAL RULES:
+  - Output raw code only -- never wrap it in a markdown code fence
+    (no ``` lines, no language tag). The output is written directly to a .ts file; a code fence around it is a syntax error.
+  - Wrap the entire test in exactly one describe() block containing
+    exactly one it() block. Every cy. command must be inside that it() block -- a cy. command outside describe()/it() fails immediately with "Cannot call cy.visit() outside a running test".
+  - Follow the plan and request precisely.
+  - Use exact selectors if specified.
+  - cy.visit() must always use the exact URL given in the plan --
+    never guess or append a path (e.g. /login) that was not explicitly stated.
+  - cy.visit() must be its own standalone statement -- never chained
+    with other commands (not cy.visit(url).get(...)).
+  - When the plan says to click on a piece of text with no element
+    type given, use cy.contains('text').click() -- never invent a CSS attribute like [text="..."], which is not valid CSS or HTML.
+  - Use a real assertion for verification steps (e.g.
+    cy.url().should('include', path), cy.get(sel).should(...)) -- never "verify" something by just calling cy.visit() on it again.
+  - When the plan says to verify the current page, page link, or
+    URL is some value, use cy.url().should('eq', value) or .should('include', path) -- the current URL is a browser property, not an <a href> element rendered on the page, so never search for a link with that href instead.
+  - Checkboxes and radio buttons: use cy.get(selector).check() or
+    .uncheck() -- never .click() to toggle them.
+  - A <select> dropdown: use cy.get(selector).select('value') --
+    never click it open and click an option like a custom widget.
+  - A file upload: use cy.get(selector).selectFile('path') --
+    never .type() a file path into an input.
+  - Never use cy.wait(<milliseconds>) to wait for a fixed delay --
+    wait on a real condition instead: an assertion (cy.get(sel).should(...)) or cy.wait('@alias') on an intercepted request.
+  - If a selector could match more than one element, scope it
+    explicitly (.first(), .eq(n), or a more specific selector) -- don't leave Cypress to fail on an ambiguous multi-match.
+  - If a step mentions an API response, error, or network
+    condition, set up cy.intercept() with an alias before the action that triggers the request, then cy.wait('@alias') if the plan needs to wait on it.
+  - Begin the file with: /// <reference types="cypress" />
+  - Output only code, no explanations."""
 MODEL_ENV_PREFIX = 'QWEN3_LORA'
+CONTEXT_RESOURCES = [{'name': 'cypressDocs', 'type': 'knowledge_base', 'paths': ['https://docs.cypress.io', 'https://docs.cypress.io/api', 'https://docs.cypress.io/guides'], 'rag': {'loader': 'web', 'splitter': 'recursive', 'chunk_size': 400, 'chunk_overlap': 50, 'embeddings': {'provider': 'huggingface', 'model': 'sentence-transformers/all-MiniLM-L6-v2'}, 'vector_store': {'type': 'faiss', 'persist_path': '.rag/cypress/docs'}, 'retrieval': {'strategy': 'similarity', 'top_k': 4}}}, {'name': 'cypressBestPractices', 'type': 'knowledge_base', 'paths': ['https://docs.cypress.io/guides/references/best-practices', 'https://docs.cypress.io/guides/references/assertions', 'https://docs.cypress.io/guides/references/trade-offs', 'https://docs.cypress.io/faq/questions/using-cypress-faq'], 'rag': {'loader': 'web', 'splitter': 'recursive', 'chunk_size': 800, 'chunk_overlap': 100, 'embeddings': {'provider': 'huggingface', 'model': 'sentence-transformers/all-MiniLM-L6-v2'}, 'vector_store': {'type': 'faiss', 'persist_path': '.rag/cypress/best-practices'}, 'retrieval': {'strategy': 'mmr', 'top_k': 3}}}]
 
 
 class Executor(AgentExecutor):
@@ -46,7 +84,11 @@ class Executor(AgentExecutor):
         inputs: dict[str, Any] = parts[0] if parts else {}
         state = dict(inputs)
 
-        result = call_llm(env_prefix=MODEL_ENV_PREFIX, model='qwen3_lora', prompt=PROMPT, inputs=inputs)
+        rag_query = "\n".join(f"{name}: {inputs.get(name)}" for name in ['test_plan'])
+        rag_chunks = []
+        for resource_dict in CONTEXT_RESOURCES:
+            rag_chunks.extend(retrieve(resource_from_dict(resource_dict), rag_query))
+        result = call_llm(env_prefix=MODEL_ENV_PREFIX, model='qwen3_lora', prompt=PROMPT, inputs=inputs, subscribed=['test_plan'], context_chunks=rag_chunks)
         state['test_script'] = result
 
         reply = h.new_data_message(state, context_id=context.context_id, task_id=context.task_id)

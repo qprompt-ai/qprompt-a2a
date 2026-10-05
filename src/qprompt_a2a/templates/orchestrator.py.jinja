@@ -16,15 +16,35 @@ synthesized by codegen, not one of the graph's declared agents.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from qprompt_a2a.runtime import call_agent
 
-MAX_LOOPS = {{ max_loops }}
+# Bind-mounted into this container by docker-compose.yml at a fixed path so
+# outputs written here land on the host regardless of who called /run --
+# a curl from anywhere, or the tasks/*.py convenience scripts.
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/opt/output"))
+
+# One entry per `tasks:` block in the .qprompt source targeting this
+# workflow -- supplies /run's default inputs/outputs when a request names
+# a `task`, so a plain `{"task": "loginTest"}` reproduces exactly what the
+# .qprompt file declares, with no client-side duplication of those
+# defaults (unlike the old tasks/*.py, which used to hardcode them).
+TASKS: dict[str, dict[str, Any]] = {
+{% for task in tasks %}
+    {{ task.name | pyrepr }}: {
+        "inputs": {{ task.inputs | py_literal }},
+        "outputs": {{ task.outputs | py_literal }},
+    },
+{% endfor %}
+}
 
 AGENT_URLS: dict[str, str] = {
 {% for svc in services %}
@@ -55,21 +75,62 @@ _DIRECT_EDGES: dict[str, str] = {
 async def run_workflow(inputs: dict[str, Any]) -> dict[str, Any]:
     state: dict[str, Any] = dict(inputs)
     current = ENTRY_POINT
-    loops = 0
+    # Keyed by checkpoint name, not one number shared across every
+    # checkpoint -- a workflow with several conditional-edge steps (e.g.
+    # validatePlan, lint, runTests) would otherwise have one checkpoint's
+    # retries eat into another's budget, or a step's own passing
+    # forward-progress count against a budget it never actually used.
+    retries: dict[str, int] = {}
 
     while current != "END":
-        state.update(await call_agent(AGENT_URLS[current], state))
+        print(f"[orchestrator] -> calling {current!r}", flush=True)
+        try:
+            state.update(await call_agent(AGENT_URLS[current], state))
+        except Exception as exc:
+            # The call itself failing (backend crash, timeout, a model's
+            # context window exceeded, etc.) isn't the same thing as an
+            # agent reporting a data-shape failure through emit_state --
+            # there's no declared route for it, so don't guess at recovery
+            # by continuing the graph. Stopping here with a clear
+            # failed/error means a caller gets an honest response instead
+            # of an unhandled 500 and a connection that never resolves.
+            state["failed"] = True
+            state["error"] = str(exc)
+            print(f"[orchestrator] {current!r} call failed: {exc}", flush=True)
+            break
+        print(f"[orchestrator]    {current!r} done, failed={state.get('failed')!r}", flush=True)
+        if state.get("failed") and (state.get("rule") or state.get("reason") or state.get("details")):
+            print(
+                f"[orchestrator]      rule={state.get('rule')!r} reason={str(state.get('reason'))[:300]!r} "
+                f"details={str(state.get('details'))[:500]!r}",
+                flush=True,
+            )
 
 {% for cedge in view.conditional_edges %}
         if current == {{ cedge.source | pyrepr }}:
-            loops += 1
-            if loops > MAX_LOOPS:
-                break
-            current = _route_{{ cedge.source }}(state)
+            next_step = _route_{{ cedge.source }}(state)
+            if next_step != "END" and state.get("failed"):
+                # Only counts against budget when this checkpoint actually
+                # failed and is routing backward for another attempt --
+                # rule/reason/details are always fresh here, since they
+                # were just set by the call above, this iteration.
+                retries[{{ cedge.source | pyrepr }}] = retries.get({{ cedge.source | pyrepr }}, 0) + 1
+                if retries[{{ cedge.source | pyrepr }}] > {{ cedge.retry }}:
+                    state["failed"] = True
+                    state["_max_loops_exceeded"] = True
+                    print(f"[orchestrator] retry budget ({{ cedge.retry }}) exceeded at {current!r}, stopping", flush=True)
+                    break
+                print(f"[orchestrator]    routing {current!r} -> {next_step!r} (retry {retries[{{ cedge.source | pyrepr }}]}/{{ cedge.retry }})", flush=True)
+            else:
+                print(f"[orchestrator]    routing {current!r} -> {next_step!r}", flush=True)
+            current = next_step
             continue
 {% endfor %}
-        current = _DIRECT_EDGES.get(current, "END")
+        next_step = _DIRECT_EDGES.get(current, "END")
+        print(f"[orchestrator]    {current!r} -> {next_step!r} (direct)", flush=True)
+        current = next_step
 
+    print(f"[orchestrator] workflow finished, failed={state.get('failed')!r}", flush=True)
     return state
 
 
@@ -77,12 +138,74 @@ app = FastAPI()
 
 
 class RunRequest(BaseModel):
-    inputs: dict[str, Any]
+    # Name of a `tasks:` entry to use as the default inputs/outputs, or
+    # None to run with only `inputs` below (and no output files written).
+    task: str | None = None
+    # Merged over the named task's declared inputs, if any -- lets a
+    # caller override just one field (e.g. given_query) without repeating
+    # the rest, or run ad hoc with no task at all.
+    inputs: dict[str, Any] = {}
+    # Merged over the named task's declared outputs, if provided; use
+    # {"channel": "memory"} to suppress writing a channel the task would
+    # otherwise persist. None (the default) means "use the task's as-is".
+    outputs: dict[str, str] | None = None
+
+
+# Per-output-path locks -- confirmed against two real concurrent /run
+# calls: outputs: is a *fixed* destination per task (e.g. loginTest always
+# targets generated/login.cy.ts), not a per-request one, so two overlapping
+# requests race to write the same file and whichever finishes last wins --
+# meaning the JSON response you got back may not match what's actually on
+# disk. Locking run_workflow()+write together, keyed by the exact
+# destination path(s) a request would write, means two requests only ever
+# queue behind each other if they'd truly collide; anything else (a
+# different task, a request with no file outputs, an override pointed at a
+# different path) still runs fully in parallel.
+_OUTPUT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(dest_paths: tuple[str, ...]) -> asyncio.Lock:
+    key = "\n".join(sorted(dest_paths))
+    if key not in _OUTPUT_LOCKS:
+        _OUTPUT_LOCKS[key] = asyncio.Lock()
+    return _OUTPUT_LOCKS[key]
+
+
+def _write_outputs(outputs: dict[str, str], result: dict[str, Any]) -> dict[str, str]:
+    written: dict[str, str] = {}
+    for channel, dest in outputs.items():
+        if dest == "memory":
+            continue
+        value = result.get(channel)
+        if value is None:
+            continue
+        path = OUTPUT_DIR / dest
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value if isinstance(value, str) else json.dumps(value, indent=2))
+        written[channel] = str(path)
+        print(f"[orchestrator] wrote {channel!r} -> {path}", flush=True)
+    return written
 
 
 @app.post("/run")
 async def run(request: RunRequest) -> dict[str, Any]:
-    return await run_workflow(request.inputs)
+    task = TASKS.get(request.task) if request.task else None
+    if request.task and task is None:
+        raise HTTPException(status_code=404, detail=f"no task named {request.task!r} for this workflow")
+
+    merged_inputs = {**(task["inputs"] if task else {}), **request.inputs}
+    merged_outputs = request.outputs if request.outputs is not None else (task["outputs"] if task else {})
+    dest_paths = tuple(sorted(dest for dest in merged_outputs.values() if dest != "memory"))
+
+    if dest_paths:
+        async with _lock_for(dest_paths):
+            result = await run_workflow(merged_inputs)
+            written = _write_outputs(merged_outputs, result)
+    else:
+        result = await run_workflow(merged_inputs)
+        written = {}
+
+    return {**result, "_written_outputs": written}
 
 
 if __name__ == "__main__":

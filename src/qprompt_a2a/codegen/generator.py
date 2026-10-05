@@ -59,6 +59,18 @@ def render_project(ir: QpromptIR, workflow_name: str, out_dir: Path) -> dict[str
         if svc.node.agent.kind == "container"
     }
 
+    # This project's own directory, mounted read-only at /rag so a
+    # container-side QPROMPT_RAG_ROOT=/rag resolves resource.rag.
+    # vector_store.persist_path (e.g. ".rag/test-plan-strategies") exactly
+    # the same way `qprompt-langgraph index` does when run against this
+    # same directory on the host -- one rag_root concept, not a
+    # container-only special case. Indices are built offline before `docker
+    # compose up`, never written to from inside a container (mounted
+    # read-only). Distinct from host_workspace_dirs: RAG indices are built
+    # once and read many times, workspace dirs are per-call scratch
+    # created/destroyed by workspace_dir().
+    rag_index_host_dir = str(out_dir.resolve())
+
     files: dict[str, str] = {}
 
     agent_tpl = _ENV.get_template("agent_service.py.jinja")
@@ -72,12 +84,14 @@ def render_project(ir: QpromptIR, workflow_name: str, out_dir: Path) -> dict[str
             workflow_name=workflow_name,
         )
 
+    tasks_for_workflow = [t for t in ir.tasks if t.workflow == workflow_name]
+
     orch_tpl = _ENV.get_template("orchestrator.py.jinja")
     files["orchestrator.py"] = orch_tpl.render(
         ir=ir,
         view=view.workflow,
         services=view.services,
-        max_loops=workflow.max_loops or 10,
+        tasks=tasks_for_workflow,
         port=ORCHESTRATOR_PORT,
     )
 
@@ -96,17 +110,29 @@ def render_project(ir: QpromptIR, workflow_name: str, out_dir: Path) -> dict[str
         view=view.workflow,
         services=view.services,
         models=view.models,
+        secrets=view.secret_names,
         orchestrator_host_port=ORCHESTRATOR_HOST_PORT,
         build_context=build_context,
         out_rel=out_rel,
         host_workspace_dirs=host_workspace_dirs,
+        rag_index_host_dir=rag_index_host_dir,
+        output_host_dir=str(out_dir.resolve()),
     )
 
-    container_services = [svc for svc in view.services if svc.node.agent.kind == "container"]
-    if container_services:
+    # Both kinds read the same ADAPTER_MODULES variable: container-kind for
+    # run_container adapters, llm-kind for output filters (see
+    # register_container_adapter / register_output_filter).
+    adapter_services = [svc for svc in view.services if svc.node.agent.kind in ("container", "llm")]
+    if adapter_services:
         files["docker-compose.override.yml.example"] = _ENV.get_template(
             "docker-compose.override.yml.example.jinja"
-        ).render(container_services=container_services)
+        ).render(adapter_services=adapter_services)
+
+    task_tpl = _ENV.get_template("task_runner.py.jinja")
+    for task in ir.tasks:
+        if task.workflow != workflow_name:
+            continue
+        files[f"tasks/{task.name}.py"] = task_tpl.render(task=task, orchestrator_host_port=ORCHESTRATOR_HOST_PORT)
 
     return files
 
@@ -127,5 +153,12 @@ def write_project(ir: QpromptIR, workflow_name: str, out_dir: str | Path) -> lis
     for svc in view.services:
         if svc.node.agent.kind == "container":
             (out_dir / ".workspace" / svc.compose_name).mkdir(parents=True, exist_ok=True)
+
+    # Exists (possibly empty) before the bind mount below needs it, so
+    # `docker compose up` before `qprompt-langgraph index` has been run
+    # fails inside retrieve() with an actionable FileNotFoundError, not by
+    # Docker silently creating a root-owned empty directory on first mount.
+    if any(svc.node.agent.kind == "llm" and svc.node.context_resources for svc in view.services):
+        (out_dir / ".rag").mkdir(parents=True, exist_ok=True)
 
     return written

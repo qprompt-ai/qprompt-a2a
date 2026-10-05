@@ -15,6 +15,7 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 import a2a.helpers as h
 
+from qprompt_langgraph.rag import resource_from_dict, retrieve
 from qprompt_langgraph.runtime import (
     call_http,
     evaluate_rules,
@@ -60,7 +61,7 @@ class Executor(AgentExecutor):
         )
         state['bug_details'] = report
         assignments = EMIT_STATE["on_pass" if report.get("passed") else "on_fail"]
-        state.update(resolve_state_assignments(assignments, {"report": report}))
+        state.update(resolve_state_assignments(assignments, {"report": report}, defaults={'failed': False, 'error': None, 'details': None}))
 
         reply = h.new_data_message(state, context_id=context.context_id, task_id=context.task_id)
         await event_queue.enqueue_event(reply)

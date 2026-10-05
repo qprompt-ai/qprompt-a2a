@@ -14,23 +14,27 @@
 # Both come from the same ADAPTER_MODULES variable: one module can register
 # both (qprompt_langgraph.adapters.cypress does).
 services:
-  plantest:
+  parsecv:
     environment:
-      # llm-kind, model: qwen3_finetuned
+      # llm-kind, model: qwen3_general
       - ADAPTER_MODULES=
-  gencode:
+  buildqueries:
     environment:
-      # llm-kind, model: qwen3_lora
+      # llm-kind, model: qwen3_general
       - ADAPTER_MODULES=
-  lint:
+  scrapeadzunajobs:
     environment:
-      # container-kind, image: cypress-validator
+      # container-kind, image: search-api:generic
       - ADAPTER_MODULES=
-  debugerror:
+  scrapejooblejobs:
     environment:
-      # llm-kind, model: qwen3_cydebug
+      # container-kind, image: search-api:generic
       - ADAPTER_MODULES=
-  runtests:
+  filterjobs:
     environment:
-      # container-kind, image: cypress/included
+      # llm-kind, model: qwen3_general
+      - ADAPTER_MODULES=
+  draftoutreach:
+    environment:
+      # llm-kind, model: qwen3_general
       - ADAPTER_MODULES=

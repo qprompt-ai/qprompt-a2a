@@ -44,6 +44,14 @@ class ProjectView:
     workflow: WorkflowView
     services: list[ServiceView]
     models: list[Model]
+    # Deduped, project-wide -- every distinct secret *name* any node
+    # references (see NodeView.secret_env_names), for the compose file's
+    # one top-level secrets: block. Each service's own secrets: list (which
+    # of these it actually needs) comes straight from its own
+    # node.secret_env_names in the template -- this field is only for the
+    # top-level declarations, which must be unique even if several
+    # services reference the same secret.
+    secret_names: list[str]
 
 
 def _env_prefix(name: str) -> str:
@@ -64,4 +72,6 @@ def build_project_view(ir: QpromptIR, workflow: Workflow) -> ProjectView:
     }
     models = [m for m in ir.models if m.name in used_model_names]
 
-    return ProjectView(workflow=workflow_view, services=services, models=models)
+    secret_names = sorted({name for node in workflow_view.nodes for name in node.secret_env_names})
+
+    return ProjectView(workflow=workflow_view, services=services, models=models, secret_names=secret_names)

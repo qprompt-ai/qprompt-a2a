@@ -14,6 +14,9 @@ services:
       dockerfile: {{ (out_rel ~ "/Dockerfile.agent") | yaml_str }}
       args:
         SERVICE_NAME: {{ svc.node.name | yaml_str }}
+{% if svc.node.agent.kind == 'llm' and svc.node.context_resources %}
+        NEEDS_RAG: "true"
+{% endif %}
     environment:
       - PORT=8000
       - SELF_URL=http://{{ svc.compose_name }}:8000/
@@ -26,14 +29,29 @@ services:
       # scratch path both sides can see.
       - HOST_WORKSPACE_DIR={{ host_workspace_dirs[svc.compose_name] }}
 {% endif %}
+{% if svc.node.agent.kind == 'llm' and svc.node.context_resources %}
+      - QPROMPT_RAG_ROOT=/rag
+{% endif %}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 {% if svc.node.agent.kind == 'container' %}
       - {{ (host_workspace_dirs[svc.compose_name] ~ ":/host-workspace") | yaml_str }}
 {% endif %}
+{% if svc.node.agent.kind == 'llm' and svc.node.context_resources %}
+      # Read-only: this service only ever calls retrieve() (never
+      # build_index()) -- indices are built offline via
+      # `qprompt-langgraph index`, on the host, before `docker compose up`.
+      - {{ (rag_index_host_dir ~ ":/rag:ro") | yaml_str }}
+{% endif %}
 {% if svc.node.agent.kind == 'llm' %}
     models:
       - {{ svc.node.agent.model }}
+{% endif %}
+{% if svc.node.secret_env_names %}
+    secrets:
+{% for name in svc.node.secret_env_names %}
+      - {{ name }}
+{% endfor %}
 {% endif %}
     networks:
       - qprompt
@@ -45,9 +63,16 @@ services:
       dockerfile: {{ (out_rel ~ "/Dockerfile.orchestrator") | yaml_str }}
     environment:
       - PORT=8000
+      # Task outputs (see /run's "task" field) are written here, which is
+      # bind-mounted below so they land on the host at the same relative
+      # path the .qprompt source's `outputs:` mapping declares (e.g.
+      # generated/login.cy.ts ends up at <this project dir>/generated/login.cy.ts).
+      - OUTPUT_DIR=/opt/output
 {% for svc in services %}
       - {{ svc.env_prefix }}_URL=http://{{ svc.compose_name }}:8000
 {% endfor %}
+    volumes:
+      - {{ (output_host_dir ~ ":/opt/output") | yaml_str }}
     ports:
       - "{{ orchestrator_host_port }}:8000"
     depends_on:
@@ -71,6 +96,20 @@ models:
       - {{ flag | yaml_str }}
 {% endfor %}
 {% endif %}
+{% endfor %}
+{% endif %}
+
+{% if secrets %}
+# Each secret's real value is never written to disk in this repo -- set it
+# in whatever environment `docker compose up` itself runs in (e.g.
+# `JOOBLE_API_KEY=... docker compose up`), and Compose mounts it at
+# /run/secrets/<name> for every service listed below, which
+# runtime.resolve_secret reads from. See qprompt_langgraph.runtime
+# .resolve_secret's docstring for the non-Compose (plain env var) fallback.
+secrets:
+{% for name in secrets %}
+  {{ name }}:
+    environment: {{ name }}
 {% endfor %}
 {% endif %}
 

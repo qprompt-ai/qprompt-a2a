@@ -13,11 +13,17 @@ services:
       dockerfile: "qprompt-a2a/examples/generated/cypressFlow/Dockerfile.agent"
       args:
         SERVICE_NAME: "planTest"
+        NEEDS_RAG: "true"
     environment:
       - PORT=8000
       - SELF_URL=http://plantest:8000/
+      - QPROMPT_RAG_ROOT=/rag
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Read-only: this service only ever calls retrieve() (never
+      # build_index()) -- indices are built offline via
+      # `qprompt-langgraph index`, on the host, before `docker compose up`.
+      - "/home/yassine-ouhadi/qprompt/qprompt-a2a/examples/generated/cypressFlow:/rag:ro"
     models:
       - qwen3_finetuned
     networks:
@@ -43,11 +49,17 @@ services:
       dockerfile: "qprompt-a2a/examples/generated/cypressFlow/Dockerfile.agent"
       args:
         SERVICE_NAME: "genCode"
+        NEEDS_RAG: "true"
     environment:
       - PORT=8000
       - SELF_URL=http://gencode:8000/
+      - QPROMPT_RAG_ROOT=/rag
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Read-only: this service only ever calls retrieve() (never
+      # build_index()) -- indices are built offline via
+      # `qprompt-langgraph index`, on the host, before `docker compose up`.
+      - "/home/yassine-ouhadi/qprompt/qprompt-a2a/examples/generated/cypressFlow:/rag:ro"
     models:
       - qwen3_lora
     networks:
@@ -81,13 +93,19 @@ services:
       dockerfile: "qprompt-a2a/examples/generated/cypressFlow/Dockerfile.agent"
       args:
         SERVICE_NAME: "debugError"
+        NEEDS_RAG: "true"
     environment:
       - PORT=8000
       - SELF_URL=http://debugerror:8000/
+      - QPROMPT_RAG_ROOT=/rag
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Read-only: this service only ever calls retrieve() (never
+      # build_index()) -- indices are built offline via
+      # `qprompt-langgraph index`, on the host, before `docker compose up`.
+      - "/home/yassine-ouhadi/qprompt/qprompt-a2a/examples/generated/cypressFlow:/rag:ro"
     models:
-      - qwen3_finetuned
+      - qwen3_cydebug
     networks:
       - qprompt
 
@@ -119,12 +137,19 @@ services:
       dockerfile: "qprompt-a2a/examples/generated/cypressFlow/Dockerfile.orchestrator"
     environment:
       - PORT=8000
+      # Task outputs (see /run's "task" field) are written here, which is
+      # bind-mounted below so they land on the host at the same relative
+      # path the .qprompt source's `outputs:` mapping declares (e.g.
+      # generated/login.cy.ts ends up at <this project dir>/generated/login.cy.ts).
+      - OUTPUT_DIR=/opt/output
       - PLAN_TEST_URL=http://plantest:8000
       - VALIDATE_PLAN_URL=http://validateplan:8000
       - GEN_CODE_URL=http://gencode:8000
       - LINT_URL=http://lint:8000
       - DEBUG_ERROR_URL=http://debugerror:8000
       - RUN_TESTS_URL=http://runtests:8000
+    volumes:
+      - "/home/yassine-ouhadi/qprompt/qprompt-a2a/examples/generated/cypressFlow:/opt/output"
     ports:
       - "8000:8000"
     depends_on:
@@ -139,10 +164,13 @@ services:
 
 models:
   qwen3_finetuned:
-    model: "ai/qwen3:14B-Q6_K-finetuned"
+    model: "ghcr.io/qprompt-ai/qwen3-testplan:0.6b-q4_k_m"
     context_size: 8192
   qwen3_lora:
-    model: "ai/qwen3:14B-Q6_K-lora"
+    model: "ghcr.io/qprompt-ai/qwen3-cypress-codegen:0.6b-q4_k_m"
+    context_size: 8192
+  qwen3_cydebug:
+    model: "ghcr.io/qprompt-ai/qwen3-cydebug:0.6b-q4_k_m"
     context_size: 8192
 
 networks:

@@ -25,6 +25,7 @@ What's new here is specific to this target:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import a2a.helpers as h
@@ -38,65 +39,121 @@ from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill, 
 from fastapi import FastAPI
 
 
-class _SafeFormatDict(dict):
-    """Used with str.format_map so an unresolved top-level placeholder
-    (e.g. a prompt's leftover {output_format} that nothing in `inputs` ever
-    populates) renders back as literal text instead of raising -- prompts
-    are free-form STRING literals in the DSL, not a validated template
-    language, so a strict .format() would crash on any prompt authored
-    before this substitution convention existed."""
+_PLACEHOLDER_RE = re.compile(r"\{(state\.)?([A-Za-z_][A-Za-z0-9_]*)\}")
 
-    def __missing__(self, key: str) -> str:
-        return "{" + key + "}"
+# Fields cydebugger's prompt is documented to read via {state.<field>} --
+# resolved even if this exact call never set them, same as render_prompt's
+# old _State object defaulted them to None rather than raising.
+_STATE_DEFAULTS = ("rule", "reason", "details", "error")
 
 
 def render_prompt(template: str, inputs: dict[str, Any]) -> str:
     """Fills `{channel_name}` and `{state.field}` placeholders in a prompt
-    from the current inputs/state dict. `state.<field>` access is supported
-    by exposing the same dict as an attribute-accessible namespace; a
-    missing field there still raises inside str.format's own machinery
-    (unlike a missing top-level key), so agent_state/validation_state's
-    conventional fields (rule, reason, details, error) are defaulted to
-    None -- the fields cydebugger's prompt is documented to read."""
+    from the current inputs/state dict.
 
-    class _State:
-        def __init__(self, data: dict[str, Any]):
-            for key in ("rule", "reason", "details", "error"):
-                setattr(self, key, data.get(key))
-            for key, value in data.items():
-                setattr(self, key, value)
+    Regex-based, not str.format -- a prompt is a free-form STRING literal in
+    the DSL, not a validated template language, and str.format_map would
+    treat *any* other `{`/`}` in the template as format syntax too, which
+    real content downstream can easily contain: a state.details value that's
+    a dict's own repr (literal braces), or RAG-retrieved reference material
+    full of real code snippets (see augment_prompt) -- confirmed against a
+    real run: a retrieved Cypress-docs chunk containing a stray `}` crashed
+    str.format_map with "Single '}' encountered in format string", which
+    the old implementation's `except (KeyError, IndexError)` didn't even
+    catch. A placeholder naming a key `inputs`/state doesn't have (e.g. a
+    prompt's leftover {output_format} nothing ever populates) renders back
+    as literal text, same as before; anything that isn't `{name}` or
+    `{state.name}` shaped is never touched at all, so this can't crash or
+    partially-substitute regardless of what the rest of the template or any
+    appended content contains."""
 
-    context = _SafeFormatDict(inputs)
-    context["state"] = _State(inputs)
-    try:
-        return template.format_map(context)
-    except (KeyError, IndexError):
-        return template
+    def _replace(match: re.Match[str]) -> str:
+        is_state, name = match.group(1), match.group(2)
+        if is_state and (name in _STATE_DEFAULTS or name in inputs):
+            return str(inputs.get(name))
+        if not is_state and name in inputs:
+            return str(inputs[name])
+        return match.group(0)
+
+    return _PLACEHOLDER_RE.sub(_replace, template)
 
 
-def call_llm(*, env_prefix: str, model: str, prompt: str, inputs: dict[str, Any]) -> str:
+def call_llm(
+    *,
+    env_prefix: str,
+    model: str,
+    prompt: str,
+    inputs: dict[str, Any],
+    subscribed: list[str],
+    context_chunks: list[str] = (),
+) -> str:
     """Real `call_llm`, backed by whatever model Compose injected for this
     service. `env_prefix` is the *Compose model name*'s env var prefix
     (e.g. `QWEN3_FINETUNED`), not the agent's name -- one model can back
     several agents, so it's looked up from `ir.models`, not derived from
-    the calling agent."""
+    the calling agent.
+
+    `inputs` is the orchestrator's *entire* accumulated pipeline state
+    (every channel and control field set by every step so far, not just
+    this agent's own) -- `render_prompt` needs that full picture, since a
+    prompt's `{state.rule}`-style placeholders can reference a field a
+    different agent wrote. The user turn is not the same thing: confirmed
+    against a real run, dumping all of `inputs` into it (rather than just
+    `subscribed`, the channels this agent's own `subscribe:` declares) hits
+    a real model's context limit a few steps into the workflow -- lint's
+    emit_state alone puts a JSON report under `bug_details` *and* a subset
+    of the same data under `details`, and every subsequent LLM call was
+    re-sending both, verbatim, in every turn.
+
+    `context_chunks` (RAG-retrieved text, see qprompt_langgraph.rag) is
+    appended via `augment_prompt` *after* `render_prompt`, not folded into
+    `prompt` by the caller first -- render_prompt must only ever run once,
+    on the author-written static prompt, never on text that already
+    contains retrieved content or a rendered `{state.details}` dict repr;
+    either could coincidentally contain something shaped like a placeholder
+    and get mangled by a second pass.
+    """
     import os
 
     from openai import OpenAI
+    from qprompt_langgraph.runtime import apply_output_filters, augment_prompt
 
     base_url = os.environ[f"{env_prefix}_URL"]
     model_name = os.environ.get(f"{env_prefix}_MODEL", model)
 
     client = OpenAI(base_url=base_url, api_key="unused")
-    rendered_prompt = render_prompt(prompt, inputs)
+    rendered_prompt = augment_prompt(render_prompt(prompt, inputs), list(context_chunks))
+    user_content = "\n".join(f"{name}: {inputs.get(name)}" for name in subscribed)
     response = client.chat.completions.create(
         model=model_name,
         messages=[
             {"role": "system", "content": rendered_prompt},
-            {"role": "user", "content": "\n".join(f"{k}: {v}" for k, v in inputs.items())},
+            {"role": "user", "content": user_content},
         ],
     )
-    return response.choices[0].message.content or ""
+    content = response.choices[0].message.content or ""
+    # Fence-stripping is the only universal step: wrapping an answer in
+    # ```lang is a habit of instruction-tuned chat models generally, not
+    # of any one domain. Everything past that -- where a domain's real
+    # output starts and stops -- is an opt-in filter, see
+    # qprompt_langgraph.runtime.register_output_filter.
+    return apply_output_filters(_strip_markdown_fence(content))
+
+
+_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z0-9]*\n(.*?)\n?```$", re.DOTALL)
+
+
+def _strip_markdown_fence(text: str) -> str:
+    """Strips a wrapping ```lang ... ``` fence, if present. A prompt telling
+    a code-generating agent not to do this is not reliable enough on its own
+    to depend on -- confirmed against a real 0.6B-parameter model: the
+    instruction was explicit in cygenerator's prompt and the model still
+    fenced its output. Wrapping code in a fence is such a strong habit from
+    an instruction-tuned model's training data that stripping it
+    programmatically is the actually-robust fix, not a bigger model or a
+    more insistent prompt."""
+    match = _CODE_FENCE_RE.match(text.strip())
+    return match.group(1) if match else text
 
 
 def build_agent_app(*, name: str, description: str, tags: list[str], executor: AgentExecutor, port: int) -> FastAPI:
@@ -143,8 +200,16 @@ async def call_agent(base_url: str, state: dict[str, Any]) -> dict[str, Any]:
     one A2A data message, get the callee's updated view of it back as one
     data message. Used by the generated orchestrator to call each agent in
     turn -- never by agents calling each other directly, since routing is
-    centralized in the orchestrator (see qprompt_a2a's README for why)."""
-    async with httpx.AsyncClient(timeout=120.0) as httpx_client:
+    centralized in the orchestrator (see qprompt_a2a's README for why).
+
+    timeout=600 -- confirmed against two real runs: 120s was too tight for
+    a container-kind agent's real Cypress run (retries against a real page
+    can legitimately take a while) or a just-restarted LLM service's
+    cold-start inference, and 300s was in turn too tight for an llm-kind
+    agent reasoning over a real, multi-item tool result (e.g. filterJobs
+    over several real scraped job postings) on CPU-only inference with no
+    GPU -- raised A2AClientTimeoutError both times."""
+    async with httpx.AsyncClient(timeout=600.0) as httpx_client:
         resolver = A2ACardResolver(httpx_client, base_url=base_url)
         card = await resolver.get_agent_card()
         client = ClientFactory(ClientConfig(httpx_client=httpx_client)).create(card)

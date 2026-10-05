@@ -71,11 +71,29 @@ src/qprompt_a2a/
                                    Docker CLI since container-kind agents'
                                    run_container shells out to the host
                                    daemon via a mounted socket ("sibling
-                                   containers", not Docker-in-Docker).
+                                   containers", not Docker-in-Docker). A
+                                   second build arg, NEEDS_RAG, gates
+                                   qprompt-langgraph's [rag] extra
+                                   (LangChain/FAISS/sentence-transformers) --
+                                   confirmed against a real build this isn't
+                                   docker-cli-sized (~5.5GB per image), so
+                                   only services whose agent has non-empty
+                                   context: pay for it.
     Dockerfile.orchestrator.jinja
-    docker-compose.yml.jinja
-  runtime.py         call_llm (Docker Model Runner-backed), build_agent_app,
-                     call_agent -- see its own docstring.
+    docker-compose.yml.jinja       For an llm-kind service with non-empty
+                                   context:, also sets QPROMPT_RAG_ROOT and
+                                   bind-mounts this project's own directory
+                                   read-only at /rag -- same rag_root
+                                   resolution `qprompt-langgraph index` uses
+                                   when run directly against this directory
+                                   on the host, no container-only special
+                                   case.
+  runtime.py         call_llm (Docker Model Runner-backed), render_prompt,
+                     build_agent_app, call_agent -- see each's own
+                     docstring. render_prompt is regex-based, not
+                     str.format -- confirmed against a real run, a
+                     RAG-retrieved chunk's stray brace crashed the old
+                     str.format_map-based version outright.
   cli.py             `qprompt-a2a render <ir.json> <workflow-name> -o <dir>`
 ```
 
